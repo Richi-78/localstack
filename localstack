@@ -1,0 +1,39 @@
+#!/bin/bash
+# LocalStack Launcher
+# Usage: ./localstack
+#
+# Run this as your normal user. LocalStack asks for administrator rights
+# per-action via polkit; it must NOT be started with sudo.
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if [ "$EUID" -eq 0 ]; then
+    echo "Error: do not run LocalStack as root."
+    echo
+    echo "Running the GUI as root writes root-owned files into your projects"
+    echo "and stores settings in /root. Start it as your normal user instead:"
+    echo "    $SCRIPT_DIR/localstack"
+    echo
+    echo "It will prompt for your password only when it needs to change"
+    echo "Apache config, /etc/hosts, SELinux labels, or system services."
+    exit 1
+fi
+
+if ! command -v python3 &> /dev/null; then
+    echo "Error: python3 not found. Install with: sudo dnf install python3"
+    exit 1
+fi
+
+if ! python3 -c "import tkinter" 2>/dev/null; then
+    echo "Error: python3-tkinter not found."
+    echo "Install with: sudo dnf install python3-tkinter"
+    exit 1
+fi
+
+if ! command -v pkexec &> /dev/null; then
+    echo "Warning: pkexec not found — privileged actions will fall back to sudo,"
+    echo "which needs a terminal. Install with: sudo dnf install polkit"
+    echo
+fi
+
+exec python3 "$SCRIPT_DIR/main.py" "$@"

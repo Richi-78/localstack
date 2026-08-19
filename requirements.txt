@@ -1,0 +1,6 @@
+# LocalStack - Local Web Development Environment Manager for Fedora
+# Core dependencies (minimal)
+pynput  # optional: for keyboard shortcuts
+
+# Note: tkinter is included with Python 3 on Fedora by default
+# If missing: sudo dnf install python3-tkinter

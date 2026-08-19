@@ -1,5 +1,8 @@
 # 🦆 LocalStack
 
+Disclaimer: This app is born out of my frustration for managing web projects in developement locally. 
+Main idea was developped and scaffolded with Qwen3.6-35B-A3B locally, refined and fixed with Opus 5 
+
 A **XAMPP-like local web development environment manager** for Fedora Linux.
 
 > Finally, an easy way to set up Apache + PHP + MySQL locally on Linux!

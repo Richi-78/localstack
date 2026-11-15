@@ -8,6 +8,7 @@ from typing import Optional
 
 from src import privileged
 from src.privileged import PrivilegeError
+from src.platform_info import mysql_service
 
 
 def _run_mysql_sql(sql: str) -> tuple[int, str]:
@@ -89,9 +90,9 @@ class DBManager:
 
     @classmethod
     def _is_mysql_running(cls) -> bool:
-        """Check if MySQL service is active."""
+        """Check if the MySQL-compatible service is active."""
         result = subprocess.run(
-            ["systemctl", "is-active", "mysqld"],
+            ["systemctl", "is-active", mysql_service()],
             capture_output=True,
             text=True,
         )
@@ -99,27 +100,27 @@ class DBManager:
 
     @classmethod
     def start_mysql(cls) -> tuple[bool, str]:
-        """Start MySQL service."""
+        """Start MySQL-compatible service."""
         try:
-            ok, out, err = privileged.run(["service", "--action", "start", "--unit", "mysqld"])
+            ok, out, err = privileged.run(["service", "--action", "start", "--unit", mysql_service()])
         except PrivilegeError as exc:
             return False, str(exc)
         return ok, "MySQL started" if ok else (err or "systemctl start mysqld failed")
 
     @classmethod
     def stop_mysql(cls) -> tuple[bool, str]:
-        """Stop MySQL service."""
+        """Stop MySQL-compatible service."""
         try:
-            ok, out, err = privileged.run(["service", "--action", "stop", "--unit", "mysqld"])
+            ok, out, err = privileged.run(["service", "--action", "stop", "--unit", mysql_service()])
         except PrivilegeError as exc:
             return False, str(exc)
         return ok, "MySQL stopped" if ok else (err or "systemctl stop mysqld failed")
 
     @classmethod
     def enable_mysql(cls) -> tuple[bool, str]:
-        """Enable MySQL to start on boot."""
+        """Enable MySQL-compatible service on boot."""
         try:
-            ok, out, err = privileged.run(["service", "--action", "enable", "--unit", "mysqld"])
+            ok, out, err = privileged.run(["service", "--action", "enable", "--unit", mysql_service()])
         except PrivilegeError as exc:
             return False, str(exc)
         return ok, "MySQL enabled on boot" if ok else (err or "systemctl enable mysqld failed")
@@ -159,7 +160,7 @@ class DBManager:
         }
 
         result = subprocess.run(
-            ["systemctl", "is-active", "mysqld"],
+            ["systemctl", "is-active", mysql_service()],
             capture_output=True,
             text=True,
         )

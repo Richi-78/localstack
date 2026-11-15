@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-LocalStack - Local Web Development Environment Manager for Fedora
+LocalStack - Local Web Development Environment Manager for Linux
 ===============================================================
 
 A XAMPP-like tool for Linux that simplifies setting up Apache + PHP + MySQL.
@@ -50,12 +50,13 @@ def main():
 
     if not check_prerequisites():
         print("Error: tkinter is not installed.")
-        print("Install it with: sudo dnf install python3-tkinter")
+        print("Install tkinter using your distribution's package manager (e.g. pacman -S tk).")
         sys.exit(1)
 
-    if not os.path.exists("/usr/bin/dnf"):
-        print("Warning: dnf not found. Package management features may not work.")
-        print("LocalStack is designed for Fedora-based distributions.")
+    from src.platform_info import is_arch
+    package_manager = "pacman -S" if is_arch() else "dnf install"
+    if not (os.path.exists("/usr/bin/dnf") or os.path.exists("/usr/bin/pacman")):
+        print("Warning: supported package manager not found; package installation may not work.")
 
     import tkinter as tk
     from src import privileged
@@ -65,7 +66,7 @@ def main():
     if not can_escalate:
         print(f"Warning: {mechanism}.")
         print("Virtual hosts and service control will not work.")
-        print("Install polkit with: sudo dnf install polkit")
+        print(f"Install polkit with your package manager (e.g. sudo {package_manager} polkit).")
     else:
         print(f"Privileged actions will use: {mechanism}")
 

@@ -19,11 +19,16 @@ import subprocess
 import sys
 import tempfile
 
+try:
+    from src.platform_info import is_arch, mysql_service, apache_config_dir, apache_config_file, log_dir
+except ModuleNotFoundError:  # helper invoked directly by pkexec
+    from platform_info import is_arch, mysql_service, apache_config_dir, apache_config_file, log_dir
+
 # Only these units may be controlled. Anything else is rejected.
 ALLOWED_UNITS = {"httpd", "php-fpm", "mysqld", "mariadb"}
 ALLOWED_ACTIONS = {"start", "stop", "restart", "reload", "enable", "disable"}
 
-VHOSTS_DIR = "/etc/httpd/conf.d"
+VHOSTS_DIR = apache_config_dir()
 HOSTS_FILE = "/etc/hosts"
 CONFIG_PREFIX = "localstack_"
 
@@ -86,6 +91,13 @@ VHOST_MODPHP_TEMPLATE = """# LocalStack Virtual Host Configuration
 
 HOSTS_MARKER = "# LocalStack"
 
+# Apache may write only to these conventional runtime-data directories, never
+# to the application code/document root as a whole.
+APACHE_WRITABLE_DIRS = {
+    "uploads", "storage", "cache", "tmp", "logs", "var",
+    "database", "backups", "public/uploads",
+}
+
 
 def fail(msg: str, code: int = 1):
     print(msg, file=sys.stderr)
@@ -107,9 +119,8 @@ def check_project(name: str) -> str:
 
 
 def config_path(project: str) -> str:
-    # basename() defends against a project name that tries to escape the dir;
-    # PROJECT_RE already rejects '/', this is belt and braces.
-    return os.path.join(VHOSTS_DIR, os.path.basename(f"{CONFIG_PREFIX}{project}.conf"))
+    # basename() defends against a project name that tries to escape the dir.
+    return apache_config_file(os.path.basename(project))
 
 
 def check_docroot(path: str) -> str:
@@ -220,9 +231,28 @@ def cmd_prepare_docroot(args):
     while cur and cur != "/":
         parts.append(cur)
         cur = os.path.dirname(cur)
+    apache_user = "http" if is_arch() else "apache"
     for path in reversed(parts):
-        # Never touch anything above the user's home directory.
+        # Within the user's home, retain the existing traversal behavior.
+        # Outside it (e.g. /mnt/data), grant Apache search-only ACLs rather
+        # than making the mount's directory names world-readable.
         if home and not (path == home or path.startswith(home + os.sep)):
+            if path == "/":
+                continue
+            if not shutil.which("setfacl"):
+                problems.append(f"setfacl not found; Apache may not traverse {path}")
+                continue
+            result = subprocess.run(
+                ["setfacl", "-m", f"u:{apache_user}:--x", "--", path],
+                capture_output=True, text=True,
+            )
+            if result.returncode != 0:
+                problems.append(
+                    f"cannot grant Apache traversal on {path}: "
+                    f"{result.stderr.strip() or result.stdout.strip()}"
+                )
+            else:
+                actions.append(f"granted {apache_user} traversal on {path} (ACL)")
             continue
         try:
             mode = os.stat(path).st_mode
@@ -231,6 +261,46 @@ def cmd_prepare_docroot(args):
                 actions.append(f"chmod o+x {path}")
         except OSError as exc:
             problems.append(f"cannot chmod {path}: {exc}")
+
+    # --- DAC write access for runtime data -------------------------------
+    # Apache runs as `http` on Arch-family systems and `apache` on Fedora.
+    # ACLs preserve the project's ownership while allowing PHP to write only
+    # to explicitly selected runtime-data directories.
+    for rel in args.rw or []:
+        if rel not in APACHE_WRITABLE_DIRS:
+            problems.append(f"refusing unsupported writable directory: {rel}")
+            continue
+
+        candidate = os.path.join(app_root or docroot, rel)
+        rw_path = os.path.realpath(candidate)
+        base = os.path.realpath(app_root or docroot)
+        if not (rw_path == base or rw_path.startswith(base + os.sep)):
+            problems.append(f"refusing writable directory outside project: {rw_path}")
+            continue
+        if not os.path.isdir(rw_path):
+            continue
+        if os.path.islink(candidate):
+            problems.append(f"refusing symlink as writable directory: {candidate}")
+            continue
+
+        if not shutil.which("setfacl"):
+            problems.append("setfacl not found; install the acl package to grant Apache write access")
+            continue
+        # Existing DB files need write permission too; default ACLs cover files
+        # and subdirectories created by the app in the future.
+        for acl_args in (
+            ["-R", "-m", f"u:{apache_user}:rwX", "--", rw_path],
+            ["-m", f"d:u:{apache_user}:rwx", "--", rw_path],
+        ):
+            result = subprocess.run(["setfacl", *acl_args], capture_output=True, text=True)
+            if result.returncode != 0:
+                problems.append(
+                    f"could not grant {apache_user} write access to {rw_path}: "
+                    f"{result.stderr.strip() or result.stdout.strip()}"
+                )
+                break
+        else:
+            actions.append(f"granted {apache_user} write access to {rw_path} (ACL)")
 
     # --- SELinux ---------------------------------------------------------
     if selinux_enforcing():
@@ -269,6 +339,25 @@ def cmd_prepare_docroot(args):
     return 0 if not problems else 2
 
 
+def _prepare_arch_httpd():
+    """Enable the modules and vhost include needed by Arch's stock httpd.conf."""
+    if not is_arch():
+        return
+    main_conf = "/etc/httpd/conf/httpd.conf"
+    with open(main_conf, encoding="utf-8") as f:
+        content = f.read()
+    additions = []
+    for module in ("proxy_module", "proxy_fcgi_module", "rewrite_module"):
+        directive = f"LoadModule {module} modules/mod_{module.removesuffix('_module')}.so"
+        if not re.search(rf"^\s*LoadModule\s+{re.escape(module)}\s", content, re.M):
+            additions.append(directive)
+    include = "IncludeOptional conf/extra/localstack_*.conf"
+    if include not in content:
+        additions.append(include)
+    if additions:
+        atomic_write(main_conf, content.rstrip() + "\n\n# LocalStack managed settings\n" + "\n".join(additions) + "\n")
+
+
 def cmd_vhost_write(args):
     project = check_project(args.name)
     hostname = check_hostname(args.hostname)
@@ -282,6 +371,8 @@ def cmd_vhost_write(args):
         socket=args.fpm_socket,
     )
 
+    os.makedirs(VHOSTS_DIR, exist_ok=True)
+    _prepare_arch_httpd()
     path = config_path(project)
     backup = None
     if os.path.exists(path):
@@ -384,17 +475,40 @@ def cmd_service(args):
     return 0
 
 
+def _enable_arch_php_extensions():
+    """Load installed split PHP modules; Arch packages do not enable them."""
+    if not is_arch() or not shutil.which("php"):
+        return
+    result = subprocess.run(
+        ["php", "-r", "echo ini_get('extension_dir');"], capture_output=True, text=True
+    )
+    extension_dir = result.stdout.strip()
+    if result.returncode != 0 or not os.path.isdir(extension_dir):
+        return
+
+    modules = {"gd", "mysqli", "pdo_mysql", "pdo_sqlite", "sqlite3"}
+    loaded = subprocess.run(["php", "-m"], capture_output=True, text=True)
+    loaded_names = {line.strip().lower() for line in loaded.stdout.splitlines()}
+    lines = [f"extension={module}.so" for module in sorted(modules)
+             if module not in loaded_names and os.path.isfile(os.path.join(extension_dir, f"{module}.so"))]
+    conf_dir = "/etc/php/conf.d"
+    conf_file = os.path.join(conf_dir, "localstack.ini")
+    if lines:
+        os.makedirs(conf_dir, exist_ok=True)
+        atomic_write(conf_file, "# PHP modules enabled by LocalStack\n" + "\n".join(lines) + "\n")
+
+
 def cmd_install_packages(args):
     for pkg in args.packages:
         if not PACKAGE_RE.match(pkg):
             fail(f"Invalid package name: {pkg!r}")
-    r = subprocess.run(
-        ["dnf", "install", "-y"] + list(args.packages),
-        capture_output=True, text=True,
-    )
+    command = (["pacman", "-S", "--needed", "--noconfirm"] if is_arch()
+               else ["dnf", "install", "-y"])
+    r = subprocess.run(command + list(args.packages), capture_output=True, text=True)
     sys.stdout.write(r.stdout)
     if r.returncode != 0:
-        fail(r.stderr.strip() or "dnf install failed")
+        fail(r.stderr.strip() or f"{command[0]} package installation failed")
+    _enable_arch_php_extensions()
     return 0
 
 
@@ -418,7 +532,7 @@ def cmd_mysql(args):
 def cmd_read_log(args):
     """Return the tail of an Apache log (root-only readable)."""
     hostname = check_hostname(args.hostname)
-    path = f"/var/log/httpd/{hostname}_{args.kind}.log"
+    path = os.path.join(log_dir(), f"{hostname}_{args.kind}.log")
     if not os.path.exists(path):
         fail(f"No such log: {path}")
     r = subprocess.run(["tail", "-n", str(args.lines), path], capture_output=True, text=True)

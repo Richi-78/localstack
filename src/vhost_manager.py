@@ -12,6 +12,7 @@ from typing import Optional
 
 from src import privileged
 from src.privileged import PrivilegeError
+from src.platform_info import apache_config_dir, php_fpm_socket
 
 # Subdirectories a PHP app commonly needs to write to. Used to pick the right
 # SELinux label; missing ones are simply skipped.
@@ -31,25 +32,13 @@ IFMODULE_OPEN_RE = re.compile(r"^\s*<IfModule\s+.*mod_php", re.I)
 IFMODULE_CLOSE_RE = re.compile(r"^\s*</IfModule>", re.I)
 
 
-def _detect_php_fpm_socket() -> str:
-    """Detect the PHP-FPM socket path from the running service."""
-    for candidate in [
-        "/run/php-fpm/www.sock",
-        "/var/run/php-fpm/www.sock",
-        "/run/php/php-fpm.sock",
-    ]:
-        if os.path.exists(candidate):
-            return candidate
-    return "/run/php-fpm/www.sock"
-
-
-PHP_FPM_SOCKET = _detect_php_fpm_socket()
+PHP_FPM_SOCKET = php_fpm_socket()
 
 
 class VHostManager:
     """Manages Apache virtual host configurations."""
 
-    VHOSTS_DIR = "/etc/httpd/conf.d"
+    VHOSTS_DIR = apache_config_dir()
     CONFIG_PREFIX = "localstack_"
 
     # ---------------------------------------------------------------- naming

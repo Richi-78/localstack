@@ -98,7 +98,7 @@ class LocalStackApp:
         title = ttk.Label(header, text="🦆 LocalStack", style='Title.TLabel')
         title.pack(side='left', padx=20, pady=10)
 
-        subtitle = ttk.Label(header, text="Local Web Development Environment for Fedora", style='Subtitle.TLabel')
+        subtitle = ttk.Label(header, text="Local Web Development Environment", style='Subtitle.TLabel')
         subtitle.pack(side='left', padx=5, pady=10)
 
     def _create_notebook(self):
@@ -131,7 +131,7 @@ class LocalStackApp:
         # Instructions
         instructions = """
 Welcome to LocalStack! This tool helps you set up a local web development
-environment on Fedora, similar to XAMPP on Windows.
+environment, similar to XAMPP on Windows.
 
 Quick Start:
 1. Check the System tab for required packages
@@ -732,7 +732,7 @@ Quick Start:
             self.apache_status_label.config(foreground='#f39c12')
 
         # MySQL
-        mysql_exists, mysql_active = SystemDetector.check_service("mysqld")
+        mysql_exists, mysql_active = SystemDetector.check_service(SystemDetector.MYSQL_SERVICE)
         if not mysql_exists:
             self.mysql_status_var.set("✗ MySQL not installed")
             self.mysql_status_label.config(foreground='#e74c3c')
@@ -866,7 +866,7 @@ Quick Start:
         """Show about dialog."""
         about_text = """LocalStack v0.1.0
 
-A local web development environment manager for Fedora.
+A local web development environment manager for Linux.
 
 Features:
 • Automatic package detection & installation

@@ -20,19 +20,18 @@ if [ "$EUID" -eq 0 ]; then
 fi
 
 if ! command -v python3 &> /dev/null; then
-    echo "Error: python3 not found. Install with: sudo dnf install python3"
+    echo "Error: python3 not found. Install Python 3 using your distribution's package manager."
     exit 1
 fi
 
 if ! python3 -c "import tkinter" 2>/dev/null; then
-    echo "Error: python3-tkinter not found."
-    echo "Install with: sudo dnf install python3-tkinter"
+    echo "Error: tkinter not found. Install the tkinter package (e.g. sudo pacman -S tk on Arch)."
     exit 1
 fi
 
 if ! command -v pkexec &> /dev/null; then
     echo "Warning: pkexec not found — privileged actions will fall back to sudo,"
-    echo "which needs a terminal. Install with: sudo dnf install polkit"
+    echo "which needs a terminal. Install polkit using your distribution's package manager."
     echo
 fi
 

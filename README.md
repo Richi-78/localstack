@@ -3,14 +3,14 @@
 Disclaimer: This app is born out of my frustration for managing web projects in developement locally. 
 Main idea was developped and scaffolded with Qwen3.6-35B-A3B locally, refined and fixed with Opus 5 
 
-A **XAMPP-like local web development environment manager** for Fedora Linux.
+A **XAMPP-like local web development environment manager** for Fedora and Arch-family Linux.
 
 > Finally, an easy way to set up Apache + PHP + MySQL locally on Linux!
 
 ## Features
 
 - **📦 Auto-detect** — Checks if Apache, PHP (CLI + FPM), MySQL, SQLite are installed
-- **🔧 Easy Install** — Installs missing packages with one click (uses dnf)
+- **🔧 Easy Install** — Installs missing packages with one click (dnf on Fedora, pacman on Arch)
 - **➕ Project Wizard** — Create projects with a simple form
 - **🌐 Virtual Hosts** — Automatically creates Apache virtual host configs
 - **🐘 Database Support** — Choose MySQL or SQLite per project
@@ -22,8 +22,11 @@ A **XAMPP-like local web development environment manager** for Fedora Linux.
 ### Prerequisites
 
 ```bash
-# Install Python 3 and tkinter (usually pre-installed on Fedora)
-sudo dnf install python3 python3-tkinter
+# Fedora
+sudo dnf install python3 python3-tkinter polkit
+
+# Arch / CachyOS
+sudo pacman -S python tk polkit
 ```
 
 ### Run
@@ -36,13 +39,21 @@ cd localstack
 **Run it as your normal user — never with `sudo`.** LocalStack refuses to start
 as root, on purpose. See [Privileges](#privileges) below.
 
+On Arch/CachyOS, LocalStack enables Apache's PHP-FPM modules and vhost include
+when it writes the first virtual host. For optional MariaDB, initialize its data
+directory once after installation, then start `mariadb.service` from Services:
+
+```bash
+sudo mariadb-install-db --user=mysql --basedir=/usr --datadir=/var/lib/mysql
+```
+
 ## How It Works
 
 ### 1. System Tab
 Checks your system for required packages:
-- `httpd` (Apache Web Server)
-- `php-cli` + `php-fpm` (PHP)
-- `mysql-server` (MySQL Database)
+- Apache (`httpd` on Fedora, `apache` on Arch)
+- PHP CLI + PHP-FPM
+- MariaDB/MySQL (optional)
 - Various PHP extensions (gd, curl, xml, etc.)
 
 Click **"Install Missing Packages"** to install everything you need.
@@ -100,11 +111,12 @@ Only these are privileged:
 
 | Operation | Why root |
 |---|---|
-| Write/delete `/etc/httpd/conf.d/localstack_*.conf` | root-owned directory |
+| Write/delete Apache virtual host configs | root-owned directory |
 | Add/remove `/etc/hosts` entries | root-owned file |
+| Grant Apache traversal/write ACLs on project paths | other user's project directories |
 | `semanage fcontext` / `restorecon` / `setsebool` | SELinux policy |
-| `systemctl` on httpd, php-fpm, mysqld | system services |
-| `dnf install` | package management |
+| `systemctl` on Apache, PHP-FPM, MariaDB/MySQL | system services |
+| `dnf` / `pacman` install | package management |
 | Reading `/var/log/httpd/*` | root-readable only |
 
 The helper validates every argument it receives — hostnames and project names
@@ -112,6 +124,17 @@ against strict patterns, systemd units against an allowlist — because it is
 called by an unprivileged process. It also runs `httpd -t` after writing a
 vhost and rolls the file back if the config is invalid, so a bad project can
 never take Apache down.
+
+When preparing a virtual host, LocalStack grants Apache search-only access to
+project path components outside the user's home, then applies ACL write access
+only to existing runtime-data folders (`database`, `storage`, `uploads`,
+`public/uploads`, `cache`, `tmp`, `logs`, `var`, and `backups`). It does not
+make the project code or document root writable. SQLite databases should live
+inside one of these writable folders, since SQLite also writes temporary files
+beside the database. On Arch-family systems Apache runs as `http`; Fedora uses
+`apache`. The `acl` package (`setfacl`) is required, and the project filesystem
+must support ACLs. If it does not, LocalStack reports the permission problem
+rather than making the whole project writable.
 
 ### Why not run the GUI as root?
 
@@ -128,7 +151,8 @@ Projects are stored in `~/.local/share/localstack/projects.json` (mode `0600` �
 it holds generated database passwords). A store left behind at
 `/var/lib/localstack/` or in `/root` by an older version is migrated on first run.
 
-Virtual host configs are created in `/etc/httpd/conf.d/localstack_<name>.conf`.
+Virtual host configs are created under `/etc/httpd/conf.d/` on Fedora and
+`/etc/httpd/conf/extra/` on Arch-family systems.
 
 ## Troubleshooting
 
@@ -173,7 +197,7 @@ sudo ausearch -m avc -ts recent  # see what was actually denied
 4. Confirm the hostname resolves: `getent hosts myproject.local`
 
 ### MySQL connection fails
-1. Make sure MySQL is running: `systemctl status mysqld`
+1. Make sure MariaDB/MySQL is running (`mariadb` on Arch, `mysqld` on Fedora).
 2. Check credentials in the project folder's `db-test.php`
 
 ### Authentication dialog never appears
@@ -203,4 +227,4 @@ Pull requests welcome! This is a project born from the frustration of "why is th
 
 ---
 
-_Built with ❤️ for the Fedora community_
+_Built with ❤️ for the Linux community_

@@ -5,6 +5,7 @@ Nothing here writes to /etc directly. Every privileged step is delegated to
 src/helper.py through src/privileged.py, so the GUI never needs to be root.
 """
 
+import json
 import os
 import re
 from pathlib import Path
@@ -12,7 +13,7 @@ from typing import Optional
 
 from src import privileged
 from src.privileged import PrivilegeError
-from src.platform_info import apache_config_dir, php_fpm_socket
+from src.platform_info import apache_config_dir
 
 # Subdirectories a PHP app commonly needs to write to. Used to pick the right
 # SELinux label; missing ones are simply skipped.
@@ -30,9 +31,6 @@ PUBLIC_DIR_NAMES = {"public", "public_html", "web", "htdocs", "www", "dist"}
 PHP_DIRECTIVE_RE = re.compile(r"^\s*php_(value|flag|admin_value|admin_flag)\s", re.I)
 IFMODULE_OPEN_RE = re.compile(r"^\s*<IfModule\s+.*mod_php", re.I)
 IFMODULE_CLOSE_RE = re.compile(r"^\s*</IfModule>", re.I)
-
-
-PHP_FPM_SOCKET = php_fpm_socket()
 
 
 class VHostManager:
@@ -144,54 +142,119 @@ class VHostManager:
     # ---------------------------------------------------------------- create
 
     @classmethod
+    def _project_spec(
+        cls,
+        project_name: str,
+        document_root: str,
+        hostname: Optional[str] = None,
+        use_mod_php: bool = False,
+        prepare: bool = True,
+        previous_hostnames: Optional[list] = None,
+        mysql: Optional[dict] = None,
+    ) -> dict:
+        """Describe one project change for the helper's apply-projects call."""
+        document_root = os.path.realpath(document_root).rstrip("/")
+        app_root = cls.detect_app_root(document_root)
+        base = app_root or document_root
+        spec = {
+            "name": project_name,
+            "hostname": cls.normalize_hostname(hostname or project_name),
+            "docroot": document_root,
+            "owner": cls._owner(),
+            "prepare": prepare,
+            "mod_php": use_mod_php,
+            "rw": [
+                sub for sub in COMMON_WRITABLE_DIRS
+                if os.path.isdir(os.path.join(base, sub))
+            ],
+            "previous_hostnames": [
+                cls.normalize_hostname(h) for h in (previous_hostnames or []) if h
+            ],
+        }
+        if app_root:
+            spec["app_root"] = app_root
+        if mysql:
+            spec["mysql"] = mysql
+        return spec
+
+    @classmethod
+    def apply_projects(
+        cls,
+        projects: Optional[list] = None,
+        remove: Optional[list] = None,
+        reload: bool = False,
+    ) -> tuple[bool, dict, str]:
+        """Run every privileged change for a project operation in one go.
+
+        One pkexec prompt covers permissions, the vhost, /etc/hosts, MySQL and
+        the Apache reload. Returns (ok, payload, error).
+        """
+        spec = {
+            "projects": projects or [],
+            "remove": remove or [],
+            "reload": reload,
+        }
+        try:
+            ok, payload, err = privileged.run_json(
+                ["apply-projects"], stdin_data=json.dumps(spec)
+            )
+        except PrivilegeError as exc:
+            return False, {}, str(exc)
+        if not payload:
+            return False, {}, err or "The privileged helper returned no result."
+        return ok, payload, err
+
+    @classmethod
     def create_vhost(
         cls,
         project_name: str,
         document_root: str,
         hostname: Optional[str] = None,
         use_mod_php: bool = False,
+        mysql: Optional[dict] = None,
+        reload: bool = True,
+        previous_hostnames: Optional[list] = None,
     ) -> tuple[bool, str]:
-        """Create a virtual host configuration. Returns (success, message)."""
-        hostname = cls.normalize_hostname(hostname or project_name)
+        """Create (or update) a virtual host. Returns (success, message)."""
         document_root = os.path.realpath(document_root).rstrip("/")
-
         if not os.path.isdir(document_root):
             return False, f"Document root does not exist: {document_root}"
 
-        notes = []
+        spec = cls._project_spec(
+            project_name, document_root, hostname,
+            use_mod_php=use_mod_php,
+            previous_hostnames=previous_hostnames,
+            mysql=mysql,
+        )
+        ok, payload, err = cls.apply_projects([spec], reload=reload)
+        if not payload:
+            return False, err
 
-        # Fedora blocks Apache under /home twice over: home dirs are mode 700
-        # (DAC) and everything there is user_home_t (SELinux). Fix both, and
-        # report honestly if we could not.
-        access_ok, access_note = cls.prepare_document_root(document_root)
-        if access_note:
-            notes.append(access_note)
+        entry = (payload.get("projects") or [{}])[0]
+        notes = list(entry.get("problems") or [])
+        vhost = entry.get("vhost")
 
-        try:
-            ok, _out, err = privileged.run([
-                "vhost-write",
-                "--name", project_name,
-                "--hostname", hostname,
-                "--docroot", document_root,
-                "--fpm-socket", PHP_FPM_SOCKET,
-            ] + (["--mod-php"] if use_mod_php else []))
-        except PrivilegeError as exc:
-            return False, str(exc)
+        reload_state = payload.get("reload")
+        if reload and isinstance(reload_state, dict) and not reload_state.get("ok"):
+            notes.append(
+                "Apache was not reloaded: "
+                + (reload_state.get("message") or "unknown error")
+            )
 
-        if not ok:
-            return False, f"Failed to write virtual host: {err}"
-
-        try:
-            hosts_ok, _out, hosts_err = privileged.run(["hosts-add", "--hostname", hostname])
-            if not hosts_ok:
-                notes.append(f"/etc/hosts not updated ({hosts_err}) -- add '127.0.0.1 {hostname}' manually")
-        except PrivilegeError as exc:
-            notes.append(f"/etc/hosts not updated: {exc}")
+        if not vhost:
+            detail = err or "; ".join(notes) or "the virtual host was not written"
+            return False, f"Failed to write virtual host: {detail}"
 
         for warning in cls.check_htaccess_compat(document_root):
             notes.append(warning)
 
-        message = f"Virtual host '{hostname}' created for {document_root}"
+        message = f"Virtual host '{spec['hostname']}' created for {document_root}"
+        if entry.get("database"):
+            database = entry["database"]
+            message += (
+                f"\n  - Database '{database['name']}' and user "
+                f"'{database['user']}' ready."
+            )
         if notes:
             message += "\n  - " + "\n  - ".join(notes)
         return True, message
@@ -244,32 +307,48 @@ class VHostManager:
     # ---------------------------------------------------------------- delete
 
     @classmethod
-    def delete_vhost(cls, project_name: str, hostname: Optional[str] = None) -> tuple[bool, str]:
+    def delete_vhost(
+        cls,
+        project_name: str,
+        hostname: Optional[str] = None,
+        reload: bool = True,
+        mysql: Optional[dict] = None,
+    ) -> tuple[bool, str]:
         """Delete a virtual host config and its /etc/hosts entry.
 
         `hostname` must be the project's stored hostname -- deriving it from the
         project name breaks for custom or de-duplicated ('site-2.local') names.
+        When `mysql` is given, the project's database and user are dropped in
+        the same privileged batch. The removal runs in the same privileged
+        batch as the Apache reload.
         """
-        try:
-            ok, _out, err = privileged.run(["vhost-delete", "--name", project_name])
-        except PrivilegeError as exc:
-            return False, str(exc)
+        hostnames = [cls.normalize_hostname(hostname)] if hostname else []
+        removal = {"name": project_name, "hostnames": hostnames}
+        if mysql:
+            removal["mysql"] = mysql
+        ok, payload, err = cls.apply_projects(remove=[removal], reload=reload)
+        if not payload:
+            return False, err
 
-        if not ok:
-            return False, err or f"No virtual host found for '{project_name}'"
+        entry = (payload.get("removed") or [{}])[0]
+        notes = list(entry.get("problems") or [])
+        reload_state = payload.get("reload")
+        if reload and isinstance(reload_state, dict) and not reload_state.get("ok"):
+            notes.append(
+                "Apache was not reloaded: "
+                + (reload_state.get("message") or "unknown error")
+            )
 
-        notes = []
-        if hostname:
-            try:
-                hosts_ok, _out, hosts_err = privileged.run(
-                    ["hosts-remove", "--hostname", cls.normalize_hostname(hostname)]
-                )
-                if not hosts_ok:
-                    notes.append(f"/etc/hosts entry left in place ({hosts_err})")
-            except PrivilegeError as exc:
-                notes.append(f"/etc/hosts entry left in place: {exc}")
+        if entry.get("problems"):
+            return False, "; ".join(notes)
 
         message = f"Virtual host for '{project_name}' removed"
+        database = entry.get("database")
+        if database:
+            message += (
+                f"; database '{database['name']}' and user "
+                f"'{database['user']}' dropped"
+            )
         if notes:
             message += " (" + "; ".join(notes) + ")"
         return True, message
@@ -331,24 +410,59 @@ class VHostManager:
         if not projects:
             return True, "No projects to regenerate."
 
-        updated, failures = 0, []
+        specs, skipped = [], []
         for proj in projects:
             hostname = proj.get("hostname")
             doc_root = proj.get("document_root")
-            if not hostname or not doc_root:
+            if not hostname or not doc_root or not os.path.isdir(doc_root):
+                skipped.append(proj.get("name", "?"))
                 continue
-            ok, msg = cls.create_vhost(proj["name"], doc_root, hostname)
-            if ok:
+            specs.append(cls._project_spec(
+                proj["name"], doc_root, hostname,
+            ))
+
+        if not specs:
+            return False, "No project folder is available to regenerate."
+
+        ok, payload, err = cls.apply_projects(specs, reload=True)
+        if not payload:
+            return False, err
+
+        failures = []
+        updated = 0
+        for entry in payload.get("projects") or []:
+            if entry.get("vhost"):
                 updated += 1
             else:
-                failures.append(f"{proj['name']}: {msg}")
+                failures.append(
+                    f"{entry.get('name')}: "
+                    + ("; ".join(entry.get("problems") or []) or "not written")
+                )
+
+        notes = []
+        if skipped:
+            notes.append("Skipped missing folders: " + ", ".join(skipped))
+        reload_state = payload.get("reload")
+        if isinstance(reload_state, dict):
+            if reload_state.get("ok"):
+                notes.append("Apache reloaded.")
+            else:
+                notes.append(
+                    "Reload Apache manually ("
+                    + (reload_state.get("message") or "unknown error") + ")."
+                )
+        if err and not ok:
+            notes.append(err)
 
         if failures:
-            return False, f"Regenerated {updated}, failed:\n" + "\n".join(failures)
-
-        reload_ok, reload_msg = cls.reload_httpd()
-        suffix = "Apache reloaded." if reload_ok else f"Reload Apache manually ({reload_msg})."
-        return True, f"Regenerated {updated} virtual host config(s). {suffix}"
+            return False, (
+                f"Regenerated {updated}, failed:\n" + "\n".join(failures)
+                + ("\n" + "\n".join(notes) if notes else "")
+            )
+        return True, (
+            f"Regenerated {updated} virtual host config(s)."
+            + (" " + " ".join(notes) if notes else "")
+        )
 
     @classmethod
     def get_project_url(cls, project: dict | str) -> str:

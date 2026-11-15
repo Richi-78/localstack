@@ -42,7 +42,7 @@ HOSTNAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[
 PROJECT_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 PACKAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
 FPM_SOCKET_RE = re.compile(r"^/[A-Za-z0-9._/-]+$")
-DB_IDENT_RE = re.compile(r"^[A-Za-z0-9_]{1,64}$")
+DB_IDENT_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 
 VHOST_TEMPLATE = """# LocalStack Virtual Host Configuration
 # Project: {project}
@@ -631,6 +631,31 @@ def create_mysql_database(name, user, password, host="127.0.0.1"):
     return {"name": name, "user": user, "host": host}
 
 
+def drop_mysql_database(name, user, host="127.0.0.1"):
+    """Drop a database and its user. Used when a project is deleted."""
+    name = (name or "").strip()
+    user = (user or "").strip()
+    host = (host or "127.0.0.1").strip()
+    if not DB_IDENT_RE.match(name):
+        fail(f"Invalid database name: {name!r}")
+    if not DB_IDENT_RE.match(user):
+        fail(f"Invalid database user: {user!r}")
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        fail(f"Invalid database host: {host!r}")
+    if not _mysql_active():
+        fail(f"MySQL-compatible service ({mysql_service()}) is not running")
+
+    sql = (
+        f"DROP DATABASE IF EXISTS `{name}`;"
+        f"DROP USER IF EXISTS '{user}'@'{host}';"
+        "FLUSH PRIVILEGES;"
+    )
+    r = subprocess.run(["mysql"], input=sql, capture_output=True, text=True)
+    if r.returncode != 0:
+        fail(r.stderr.strip() or "mysql failed")
+    return {"name": name, "user": user, "host": host}
+
+
 # --------------------------------------------------------------------------
 # Batched apply: one pkexec prompt for a whole project operation
 # --------------------------------------------------------------------------
@@ -709,7 +734,8 @@ def _remove_project(item):
     if not isinstance(item, dict):
         return {"name": None, "actions": [],
                 "problems": ["invalid removal entry"], "ok": False}
-    entry = {"name": str(item.get("name") or ""), "actions": [], "problems": []}
+    entry = {"name": str(item.get("name") or ""), "actions": [],
+             "problems": [], "database": None}
 
     try:
         path = remove_vhost(entry["name"], missing_ok=True)
@@ -719,6 +745,19 @@ def _remove_project(item):
             hostname = check_hostname(str(hostname))
             if hosts_remove(hostname):
                 entry["actions"].append(f"removed {hostname} from /etc/hosts")
+
+        mysql = item.get("mysql")
+        if mysql:
+            if not isinstance(mysql, dict):
+                fail("mysql must be an object")
+            entry["database"] = drop_mysql_database(
+                mysql.get("name"), mysql.get("user"),
+                mysql.get("host") or "127.0.0.1",
+            )
+            entry["actions"].append(
+                f"dropped database {entry['database']['name']} "
+                f"and user {entry['database']['user']}"
+            )
     except (HelperError, OSError) as exc:
         entry["problems"].append(str(exc))
 

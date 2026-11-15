@@ -83,7 +83,8 @@ password once per operation.
 - **Edit** a project: change its folder, URL or database. Saving reapplies the
   virtual host, the `/etc/hosts` entry and reloads Apache. The project name is
   fixed because it is also the vhost filename and database prefix.
-- Delete projects (keeps your files!)
+- Delete projects (keeps your files; asks whether to also drop the project's
+  MySQL database and user)
 
 ### 4. Services
 - Start/stop/restart Apache, MySQL, PHP-FPM

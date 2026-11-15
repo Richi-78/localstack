@@ -312,18 +312,21 @@ class VHostManager:
         project_name: str,
         hostname: Optional[str] = None,
         reload: bool = True,
+        mysql: Optional[dict] = None,
     ) -> tuple[bool, str]:
         """Delete a virtual host config and its /etc/hosts entry.
 
         `hostname` must be the project's stored hostname -- deriving it from the
         project name breaks for custom or de-duplicated ('site-2.local') names.
-        The removal runs in the same privileged batch as the Apache reload.
+        When `mysql` is given, the project's database and user are dropped in
+        the same privileged batch. The removal runs in the same privileged
+        batch as the Apache reload.
         """
         hostnames = [cls.normalize_hostname(hostname)] if hostname else []
-        ok, payload, err = cls.apply_projects(
-            remove=[{"name": project_name, "hostnames": hostnames}],
-            reload=reload,
-        )
+        removal = {"name": project_name, "hostnames": hostnames}
+        if mysql:
+            removal["mysql"] = mysql
+        ok, payload, err = cls.apply_projects(remove=[removal], reload=reload)
         if not payload:
             return False, err
 
@@ -340,6 +343,12 @@ class VHostManager:
             return False, "; ".join(notes)
 
         message = f"Virtual host for '{project_name}' removed"
+        database = entry.get("database")
+        if database:
+            message += (
+                f"; database '{database['name']}' and user "
+                f"'{database['user']}' dropped"
+            )
         if notes:
             message += " (" + "; ".join(notes) + ")"
         return True, message

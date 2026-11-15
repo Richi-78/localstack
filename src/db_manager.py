@@ -1,10 +1,12 @@
 """
-Database Manager - handles MySQL database and user creation.
+Database Manager - SQLite setup and MySQL-compatible service state.
+
+MySQL database/user provisioning lives in the privileged helper, so every
+identifier is validated before root runs the SQL.
 """
 
 import os
 import subprocess
-from typing import Optional
 
 from src import privileged
 from src.privileged import PrivilegeError
@@ -25,34 +27,7 @@ def _run_mysql_sql(sql: str) -> tuple[int, str]:
 
 
 class DBManager:
-    """Manages MySQL database and SQLite setup."""
-
-    @classmethod
-    def create_mysql_db(
-        cls,
-        db_name: str,
-        db_user: str,
-        db_pass: str,
-        host: str = "127.0.0.1",
-    ) -> tuple[bool, str]:
-        """
-        Create MySQL database and user.
-        Returns (success, message).
-        """
-        if not cls._is_mysql_running():
-            return False, "MySQL is not running. Start it first."
-
-        sql = (
-            f"CREATE DATABASE IF NOT EXISTS `{db_name}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
-            f"CREATE USER IF NOT EXISTS '{db_user}'@'{host}' IDENTIFIED BY '{db_pass}';"
-            f"GRANT ALL PRIVILEGES ON `{db_name}`.* TO '{db_user}'@'{host}';"
-            "FLUSH PRIVILEGES;"
-        )
-
-        rc, err = _run_mysql_sql(sql)
-        if rc == 0:
-            return True, f"Database '{db_name}' and user '{db_user}' created."
-        return False, f"MySQL error: {err}"
+    """Manages SQLite setup and MySQL-compatible service state."""
 
     @classmethod
     def create_sqlite_db(cls, db_path: str) -> tuple[bool, str]:
@@ -70,23 +45,6 @@ class DBManager:
             return True, f"SQLite database created at {db_path}"
         except Exception as e:
             return False, f"Failed to create SQLite database: {e}"
-
-    @classmethod
-    def delete_mysql_db(cls, db_name: str, db_user: str) -> tuple[bool, str]:
-        """Delete MySQL database and user."""
-        if not cls._is_mysql_running():
-            return False, "MySQL is not running."
-
-        sql = (
-            f"DROP DATABASE IF EXISTS `{db_name}`;"
-            f"DROP USER IF EXISTS '{db_user}'@'127.0.0.1';"
-            "FLUSH PRIVILEGES;"
-        )
-
-        rc, err = _run_mysql_sql(sql)
-        if rc == 0:
-            return True, f"Database '{db_name}' and user '{db_user}' deleted."
-        return False, f"MySQL error: {err}"
 
     @classmethod
     def _is_mysql_running(cls) -> bool:

@@ -4,6 +4,7 @@ Project Manager - handles project creation, metadata, and lifecycle.
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from datetime import datetime
@@ -268,8 +269,8 @@ try {{
 
         # Set defaults
         if use_mysql:
-            db_name = db_name or f"{name}_db"
-            db_user = db_user or f"{name}_user"
+            db_name = cls._db_identifier(db_name or f"{name}_db")
+            db_user = cls._db_identifier(db_user or f"{name}_user")
             db_pass = db_pass or cls._generate_password()
         elif db_type == "sqlite":
             db_name = db_name or f"{name}.sqlite"
@@ -346,8 +347,8 @@ try {{
             project["db_type"] = db_type
             project["use_mysql"] = db_type == "mysql"
             if db_type == "mysql":
-                project["db_name"] = db_name or f"{name}_db"
-                project["db_user"] = db_user or f"{name}_user"
+                project["db_name"] = cls._db_identifier(db_name or f"{name}_db")
+                project["db_user"] = cls._db_identifier(db_user or f"{name}_user")
                 project["db_pass"] = db_pass or project.get("db_pass") or cls._generate_password()
             elif db_type == "sqlite":
                 project["db_name"] = db_name or f"{name}.sqlite"
@@ -376,6 +377,18 @@ try {{
     @classmethod
     def generate_password(cls, length: int = 16) -> str:
         return cls._generate_password(length)
+
+    @classmethod
+    def _db_identifier(cls, value: str) -> str:
+        """Make a project-derived name safe for a MySQL database/user.
+
+        Hyphens and dots are legal inside backticked database names and quoted
+        user names, so they are kept. Anything that could break out of those
+        quotes becomes an underscore, and the result is capped at MySQL's
+        64-character identifier limit.
+        """
+        cleaned = re.sub(r"[^A-Za-z0-9_.-]", "_", (value or "").strip())
+        return cleaned[:64] or "localstack"
 
     @classmethod
     def delete_project(cls, name: str) -> tuple[bool, str]:

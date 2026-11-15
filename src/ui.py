@@ -1199,7 +1199,20 @@ class LocalStackApp:
         )
         lines.append(vhost_msg)
 
-        self._set_form_status("\n".join(lines), "ok" if vhost_success else "warn")
+        if not vhost_success:
+            # Metadata is saved before the privileged work. If that work fails
+            # (cancelled authentication, vhost error, database down), drop the
+            # entry again so the project list never shows a half-created project.
+            ProjectManager.delete_project(name)
+            self._refresh_projects_list()
+            self._set_form_status(
+                "\n".join(lines) + "\n\nNo project was registered; fix the "
+                "problem and try again.",
+                "error",
+            )
+            return
+
+        self._set_form_status("\n".join(lines), "ok")
         self._refresh_projects_list()
 
         self.create_project_btn.configure(state="disabled", text="Created")
@@ -1371,7 +1384,28 @@ class LocalStackApp:
             self._toast("Select a project first.", "warn")
             return
 
-        if not messagebox.askyesno(
+        db_type = ProjectManager.db_type_of(project)
+        mysql = None
+        if db_type == "mysql" and project.get("db_name") and project.get("db_user"):
+            answer = messagebox.askyesnocancel(
+                "Delete project",
+                f"Delete project '{project['name']}'?\n\n"
+                "This removes the LocalStack configuration but keeps your files.\n\n"
+                f"Also delete the MySQL database '{project['db_name']}' "
+                f"and user '{project['db_user']}'?\n\n"
+                "Yes: delete the database and user\n"
+                "No: keep the database and user\n"
+                "Cancel: do nothing",
+            )
+            if answer is None:
+                return
+            if answer:
+                mysql = {
+                    "name": project["db_name"],
+                    "user": project["db_user"],
+                    "host": "127.0.0.1",
+                }
+        elif not messagebox.askyesno(
             "Delete project",
             f"Delete project '{project['name']}'?\n\n"
             "This removes the LocalStack configuration but keeps your files.",
@@ -1382,7 +1416,7 @@ class LocalStackApp:
         # custom and de-duplicated names. The helper also reloads Apache in the
         # same privileged call, so deleting costs one password prompt.
         vhost_ok, vhost_msg = VHostManager.delete_vhost(
-            project["name"], project.get("hostname"), reload=True
+            project["name"], project.get("hostname"), reload=True, mysql=mysql
         )
         success, message = ProjectManager.delete_project(project["name"])
         if not vhost_ok:

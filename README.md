@@ -16,6 +16,8 @@ A **XAMPP-like local web development environment manager** for Fedora and Arch-f
 - **🐘 Database Support** — Choose MySQL or SQLite per project
 - **🔧 Service Manager** — Start/stop/restart Apache, MySQL, PHP-FPM
 - **📁 Project Dashboard** — List, open, and manage all your projects
+- **🎨 Light & dark theme** — Card-based interface with a sidebar, status
+  badges and notifications; the choice is remembered between runs
 
 ## Installation
 
@@ -49,7 +51,7 @@ sudo mariadb-install-db --user=mysql --basedir=/usr --datadir=/var/lib/mysql
 
 ## How It Works
 
-### 1. System Tab
+### 1. Dashboard
 Checks your system for required packages:
 - Apache (`httpd` on Fedora, `apache` on Arch)
 - PHP CLI + PHP-FPM
@@ -58,9 +60,9 @@ Checks your system for required packages:
 
 Click **"Install Missing Packages"** to install everything you need.
 
-### 2. New Project Tab
+### 2. New Project
 1. Enter a project name (e.g., `mywebsite`)
-2. Select or create a project folder
+2. Pick a project folder with your desktop's native file chooser
 3. Choose your database: None / SQLite / MySQL
 4. Click **"Create Project"**
 
@@ -69,14 +71,21 @@ LocalStack will:
 - Set up an Apache virtual host at `http://mywebsite.local`
 - Create a MySQL database (if selected)
 - Add the hostname to `/etc/hosts`
+- Reload Apache
 
-### 3. Projects Tab
+All of that happens through a single privileged call, so polkit asks for your
+password once per operation.
+
+### 3. Projects
 - See all your projects in one place
 - Open any project in your browser
 - Open the project folder in your file manager
+- **Edit** a project: change its folder, URL or database. Saving reapplies the
+  virtual host, the `/etc/hosts` entry and reloads Apache. The project name is
+  fixed because it is also the vhost filename and database prefix.
 - Delete projects (keeps your files!)
 
-### 4. Services Tab
+### 4. Services
 - Start/stop/restart Apache, MySQL, PHP-FPM
 - Enable services to start on boot
 - See current status of each service
@@ -98,6 +107,7 @@ localstack/
     ├── db_manager.py    # Database management
     ├── privileged.py    # Escalates to the helper via pkexec
     ├── helper.py        # The ONLY code that runs as root
+    ├── theme.py         # Palettes, fonts and ttk widget styles
     └── ui.py            # Main GUI application
 ```
 
@@ -106,6 +116,10 @@ localstack/
 LocalStack never runs as root. The GUI runs as you; the small number of
 operations that genuinely need root are delegated to `src/helper.py`, which is
 re-invoked through **pkexec** (polkit) and prompts graphically.
+
+Project create, edit and delete send every privileged step to the helper as a
+single JSON batch (`apply-projects`): permissions, the vhost, `/etc/hosts`, the
+MySQL database and the Apache reload happen under one authentication prompt.
 
 Only these are privileged:
 
@@ -213,7 +227,7 @@ falls back to `sudo`.
 - [ ] Database import/export (SQL)
 - [ ] Project templates (WordPress, Laravel, etc.)
 - [x] Log viewer (per-project Apache error log)
-- [ ] Dark theme
+- [x] Dark theme
 - [ ] System tray icon
 - [ ] Flatpak packaging
 

@@ -216,6 +216,7 @@ try {{
         db_user: Optional[str] = None,
         db_pass: Optional[str] = None,
         hostname: Optional[str] = None,
+        db_type: Optional[str] = None,
     ) -> tuple[bool, str, Optional[dict]]:
         """
         Create a new project.
@@ -257,13 +258,25 @@ try {{
             except Exception as e:
                 return False, f"Cannot create document root: {e}", None
 
+        # db_type is the explicit choice from the wizard (none/sqlite/mysql).
+        # Older callers only pass use_mysql, so keep that behaviour as fallback.
+        if db_type is None:
+            db_type = "mysql" if use_mysql else "sqlite"
+        if db_type not in {"none", "sqlite", "mysql"}:
+            db_type = "sqlite"
+        use_mysql = db_type == "mysql"
+
         # Set defaults
         if use_mysql:
             db_name = db_name or f"{name}_db"
             db_user = db_user or f"{name}_user"
             db_pass = db_pass or cls._generate_password()
-        else:
+        elif db_type == "sqlite":
             db_name = db_name or f"{name}.sqlite"
+            db_user = None
+            db_pass = None
+        else:
+            db_name = None
             db_user = None
             db_pass = None
 
@@ -275,6 +288,7 @@ try {{
             "name": name,
             "document_root": document_root,
             "use_mysql": use_mysql,
+            "db_type": db_type,
             "db_name": db_name,
             "db_user": db_user,
             "db_pass": db_pass,
@@ -297,6 +311,71 @@ try {{
             f"Project '{name}' adopted (existing files left untouched).",
             project_data,
         )
+
+    @classmethod
+    def update_project(
+        cls,
+        name: str,
+        document_root: Optional[str] = None,
+        hostname: Optional[str] = None,
+        db_type: Optional[str] = None,
+        db_name: Optional[str] = None,
+        db_user: Optional[str] = None,
+        db_pass: Optional[str] = None,
+    ) -> tuple[bool, str, Optional[dict]]:
+        """Update an existing project. The project name itself is immutable:
+        it is the metadata key, the vhost filename and the MySQL identifier
+        prefix all at once."""
+        projects = cls._load_projects()
+        project = projects.get(name)
+        if project is None:
+            return False, f"Project '{name}' not found.", None
+
+        if document_root is not None:
+            document_root = os.path.abspath(document_root)
+            if not os.path.isdir(document_root):
+                return False, f"Document root does not exist: {document_root}", None
+            project["document_root"] = document_root
+
+        if hostname:
+            project["hostname"] = hostname
+
+        if db_type is not None:
+            if db_type not in {"none", "sqlite", "mysql"}:
+                return False, f"Unknown database type: {db_type}", None
+            project["db_type"] = db_type
+            project["use_mysql"] = db_type == "mysql"
+            if db_type == "mysql":
+                project["db_name"] = db_name or f"{name}_db"
+                project["db_user"] = db_user or f"{name}_user"
+                project["db_pass"] = db_pass or project.get("db_pass") or cls._generate_password()
+            elif db_type == "sqlite":
+                project["db_name"] = db_name or f"{name}.sqlite"
+                project["db_user"] = None
+                project["db_pass"] = None
+            else:
+                project["db_name"] = None
+                project["db_user"] = None
+                project["db_pass"] = None
+
+        project["updated_at"] = datetime.now().isoformat()
+        projects[name] = project
+        cls._save_projects(projects)
+        return True, f"Project '{name}' updated.", project
+
+    @classmethod
+    def db_type_of(cls, project: dict) -> str:
+        """Resolve the database kind, including projects from older versions."""
+        db_type = project.get("db_type")
+        if db_type in {"none", "sqlite", "mysql"}:
+            return db_type
+        if project.get("use_mysql"):
+            return "mysql"
+        return "sqlite" if project.get("db_name") else "none"
+
+    @classmethod
+    def generate_password(cls, length: int = 16) -> str:
+        return cls._generate_password(length)
 
     @classmethod
     def delete_project(cls, name: str) -> tuple[bool, str]:
@@ -332,7 +411,10 @@ try {{
                     project_name=project_data["name"],
                     document_root=project_data["document_root"],
                     url=f"http://{project_data['hostname']}",
-                    db_type="MySQL" if project_data["use_mysql"] else "SQLite",
+                    db_type=(
+                        "MySQL" if project_data["use_mysql"]
+                        else ("SQLite" if project_data.get("db_type") == "sqlite" else "None")
+                    ),
                     php_info="N/A (PHP not configured yet)",
                 ))
 

@@ -20,9 +20,15 @@ import sys
 import tempfile
 
 try:
-    from src.platform_info import is_arch, mysql_service, apache_config_dir, apache_config_file, log_dir
+    from src.platform_info import (
+        is_arch, mysql_service, apache_config_dir, apache_config_file, log_dir,
+        php_fpm_socket,
+    )
 except ModuleNotFoundError:  # helper invoked directly by pkexec
-    from platform_info import is_arch, mysql_service, apache_config_dir, apache_config_file, log_dir
+    from platform_info import (
+        is_arch, mysql_service, apache_config_dir, apache_config_file, log_dir,
+        php_fpm_socket,
+    )
 
 # Only these units may be controlled. Anything else is rejected.
 ALLOWED_UNITS = {"httpd", "php-fpm", "mysqld", "mariadb"}
@@ -35,6 +41,8 @@ CONFIG_PREFIX = "localstack_"
 HOSTNAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$")
 PROJECT_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 PACKAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
+FPM_SOCKET_RE = re.compile(r"^/[A-Za-z0-9._/-]+$")
+DB_IDENT_RE = re.compile(r"^[A-Za-z0-9_]{1,64}$")
 
 VHOST_TEMPLATE = """# LocalStack Virtual Host Configuration
 # Project: {project}
@@ -99,9 +107,12 @@ APACHE_WRITABLE_DIRS = {
 }
 
 
-def fail(msg: str, code: int = 1):
-    print(msg, file=sys.stderr)
-    sys.exit(code)
+class HelperError(Exception):
+    """A subcommand rejected or failed. main() reports it and exits non-zero."""
+
+
+def fail(msg: str):
+    raise HelperError(msg)
 
 
 def check_hostname(hostname: str) -> str:
@@ -202,7 +213,7 @@ def selinux_label(path: str, setype: str) -> list[str]:
 # Subcommands
 # --------------------------------------------------------------------------
 
-def cmd_prepare_docroot(args):
+def prepare_docroot(path, owner=None, app_root=None, rw=None):
     """Make a project directory reachable by Apache.
 
     Two distinct things can block Apache under /home:
@@ -211,21 +222,25 @@ def cmd_prepare_docroot(args):
                  the home directory and the docroot.
       * MAC   -- SELinux labels everything under /home as user_home_t, which
                  httpd_t may not read. We relabel persistently.
-    Anything that fails is reported; this command never claims false success.
+    Returns (actions, problems); anything that fails is reported.
     """
-    docroot = check_docroot(args.path)
+    docroot = check_docroot(path)
+    rw = rw or []
     problems = []
     actions = []
+
+    if owner and not re.match(r"^[A-Za-z0-9._-]+$", owner):
+        fail(f"Invalid owner: {owner!r}")
 
     # In the common layout the docroot is <app>/public while the code, .env and
     # writable dirs are siblings above it. PHP-FPM still has to read them, so
     # label the app root too when one is given.
-    app_root = check_docroot(args.app_root) if args.app_root else None
+    app_root = check_docroot(app_root) if app_root else None
     if app_root and not docroot.startswith(app_root + os.sep):
         fail(f"--app-root {app_root} does not contain --path {docroot}")
 
     # --- traversal -------------------------------------------------------
-    home = os.path.realpath(os.path.expanduser(f"~{args.owner}")) if args.owner else None
+    home = os.path.realpath(os.path.expanduser(f"~{owner}")) if owner else None
     parts = []
     cur = docroot
     while cur and cur != "/":
@@ -266,7 +281,7 @@ def cmd_prepare_docroot(args):
     # Apache runs as `http` on Arch-family systems and `apache` on Fedora.
     # ACLs preserve the project's ownership while allowing PHP to write only
     # to explicitly selected runtime-data directories.
-    for rel in args.rw or []:
+    for rel in rw or []:
         if rel not in APACHE_WRITABLE_DIRS:
             problems.append(f"refusing unsupported writable directory: {rel}")
             continue
@@ -310,7 +325,7 @@ def cmd_prepare_docroot(args):
         if not errs:
             actions.append(f"labelled {content_target} httpd_sys_content_t")
 
-        for rel in args.rw or []:
+        for rel in rw or []:
             base = app_root or docroot
             rw_path = os.path.realpath(os.path.join(base, rel))
             # Never relabel outside the tree we were asked to prepare.
@@ -335,6 +350,13 @@ def cmd_prepare_docroot(args):
             else:
                 actions.append("httpd_enable_homedirs=on")
 
+    return actions, problems
+
+
+def cmd_prepare_docroot(args):
+    actions, problems = prepare_docroot(
+        args.path, owner=args.owner, app_root=args.app_root, rw=args.rw
+    )
     print(json.dumps({"actions": actions, "problems": problems}))
     return 0 if not problems else 2
 
@@ -358,17 +380,25 @@ def _prepare_arch_httpd():
         atomic_write(main_conf, content.rstrip() + "\n\n# LocalStack managed settings\n" + "\n".join(additions) + "\n")
 
 
-def cmd_vhost_write(args):
-    project = check_project(args.name)
-    hostname = check_hostname(args.hostname)
-    docroot = check_docroot(args.docroot)
+def write_vhost(project, hostname, docroot, fpm_socket=None, mod_php=False):
+    """Render and install one vhost atomically, rolling back on syntax errors.
 
-    template = VHOST_MODPHP_TEMPLATE if args.mod_php else VHOST_TEMPLATE
+    Returns the path written. Raises HelperError on invalid input or a config
+    Apache would refuse to load.
+    """
+    project = check_project(project)
+    hostname = check_hostname(hostname)
+    docroot = check_docroot(docroot)
+    fpm_socket = fpm_socket or php_fpm_socket()
+    if not mod_php and not FPM_SOCKET_RE.match(fpm_socket):
+        fail(f"Invalid PHP-FPM socket: {fpm_socket!r}")
+
+    template = VHOST_MODPHP_TEMPLATE if mod_php else VHOST_TEMPLATE
     content = template.format(
         project=project,
         servername=hostname,
         documentroot=docroot,
-        socket=args.fpm_socket,
+        socket=fpm_socket,
     )
 
     os.makedirs(VHOSTS_DIR, exist_ok=True)
@@ -393,17 +423,31 @@ def cmd_vhost_write(args):
     if backup and os.path.exists(backup):
         os.unlink(backup)
 
+    return path
+
+
+def cmd_vhost_write(args):
+    path = write_vhost(
+        args.name, args.hostname, args.docroot,
+        fpm_socket=args.fpm_socket, mod_php=args.mod_php,
+    )
     print(f"Wrote {path}")
     return 0
 
 
-def cmd_vhost_delete(args):
-    project = check_project(args.name)
+def remove_vhost(project, missing_ok=False):
+    project = check_project(project)
     path = config_path(project)
     if not os.path.exists(path):
+        if missing_ok:
+            return None
         fail(f"No virtual host config at {path}")
     os.unlink(path)
-    print(f"Removed {path}")
+    return path
+
+
+def cmd_vhost_delete(args):
+    print(f"Removed {remove_vhost(args.name)}")
     return 0
 
 
@@ -417,8 +461,8 @@ def _rewrite_hosts(transform):
     return True
 
 
-def cmd_hosts_add(args):
-    hostname = check_hostname(args.hostname)
+def hosts_add(hostname):
+    hostname = check_hostname(hostname)
 
     def transform(lines):
         for line in lines:
@@ -430,13 +474,17 @@ def cmd_hosts_add(args):
         lines.append(f"127.0.0.1 {hostname}  {HOSTS_MARKER}\n")
         return lines
 
-    changed = _rewrite_hosts(transform)
-    print(f"{'Added' if changed else 'Already present:'} {hostname}")
+    return _rewrite_hosts(transform)
+
+
+def cmd_hosts_add(args):
+    changed = hosts_add(args.hostname)
+    print(f"{'Added' if changed else 'Already present:'} {args.hostname}")
     return 0
 
 
-def cmd_hosts_remove(args):
-    hostname = check_hostname(args.hostname)
+def hosts_remove(hostname):
+    hostname = check_hostname(hostname)
 
     def transform(lines):
         out = []
@@ -456,8 +504,12 @@ def cmd_hosts_remove(args):
             out.append(line)
         return out if removed else None
 
-    changed = _rewrite_hosts(transform)
-    print(f"{'Removed' if changed else 'Not managed by LocalStack:'} {hostname}")
+    return _rewrite_hosts(transform)
+
+
+def cmd_hosts_remove(args):
+    changed = hosts_remove(args.hostname)
+    print(f"{'Removed' if changed else 'Not managed by LocalStack:'} {args.hostname}")
     return 0
 
 
@@ -529,6 +581,198 @@ def cmd_mysql(args):
     return 0
 
 
+# --------------------------------------------------------------------------
+# MySQL database provisioning
+# --------------------------------------------------------------------------
+
+def _sql_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
+def _mysql_active() -> bool:
+    r = subprocess.run(
+        ["systemctl", "is-active", mysql_service()], capture_output=True, text=True
+    )
+    return r.stdout.strip() == "active"
+
+
+def create_mysql_database(name, user, password, host="127.0.0.1"):
+    """Create a database, its user and the grant in one shot.
+
+    The caller supplies structured identifiers instead of raw SQL, so the
+    helper can validate every component before it is interpolated.
+    """
+    name = (name or "").strip()
+    user = (user or "").strip()
+    host = (host or "127.0.0.1").strip()
+    if not DB_IDENT_RE.match(name):
+        fail(f"Invalid database name: {name!r}")
+    if not DB_IDENT_RE.match(user):
+        fail(f"Invalid database user: {user!r}")
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        fail(f"Invalid database host: {host!r}")
+    if not password:
+        fail("Database password must not be empty")
+    if not _mysql_active():
+        fail(f"MySQL-compatible service ({mysql_service()}) is not running")
+
+    quoted = _sql_escape(password)
+    sql = (
+        f"CREATE DATABASE IF NOT EXISTS `{name}` "
+        "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+        f"CREATE USER IF NOT EXISTS '{user}'@'{host}' IDENTIFIED BY '{quoted}';"
+        f"ALTER USER '{user}'@'{host}' IDENTIFIED BY '{quoted}';"
+        f"GRANT ALL PRIVILEGES ON `{name}`.* TO '{user}'@'{host}';"
+        "FLUSH PRIVILEGES;"
+    )
+    r = subprocess.run(["mysql"], input=sql, capture_output=True, text=True)
+    if r.returncode != 0:
+        fail(r.stderr.strip() or "mysql failed")
+    return {"name": name, "user": user, "host": host}
+
+
+# --------------------------------------------------------------------------
+# Batched apply: one pkexec prompt for a whole project operation
+# --------------------------------------------------------------------------
+
+def _list_field(value, label):
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        fail(f"{label} must be a list")
+    return value
+
+
+def _apply_project(item):
+    if not isinstance(item, dict):
+        return {"name": None, "actions": [],
+                "problems": ["invalid project entry"], "vhost": None,
+                "database": None, "ok": False}
+    entry = {"name": str(item.get("name") or ""), "actions": [],
+             "problems": [], "vhost": None, "database": None}
+
+    try:
+        name = check_project(entry["name"])
+        hostname = check_hostname(str(item.get("hostname") or ""))
+        docroot = check_docroot(str(item.get("docroot") or ""))
+
+        if item.get("prepare", True):
+            actions, doc_problems = prepare_docroot(
+                docroot,
+                owner=item.get("owner") or None,
+                app_root=item.get("app_root") or None,
+                rw=_list_field(item.get("rw"), "rw"),
+            )
+            entry["actions"].extend(actions)
+            entry["problems"].extend(doc_problems)
+
+        # On edit, drop the old /etc/hosts mapping before adding the new one.
+        for old in _list_field(item.get("previous_hostnames"), "previous_hostnames"):
+            old = check_hostname(str(old))
+            if old != hostname and hosts_remove(old):
+                entry["actions"].append(f"removed {old} from /etc/hosts")
+
+        entry["vhost"] = write_vhost(
+            name, hostname, docroot,
+            fpm_socket=item.get("fpm_socket") or None,
+            mod_php=bool(item.get("mod_php")),
+        )
+        entry["actions"].append(f"wrote {entry['vhost']}")
+
+        if hosts_add(hostname):
+            entry["actions"].append(f"added {hostname} to /etc/hosts")
+        else:
+            entry["actions"].append(f"{hostname} already in /etc/hosts")
+
+        mysql = item.get("mysql")
+        if mysql:
+            if not isinstance(mysql, dict):
+                fail("mysql must be an object")
+            entry["database"] = create_mysql_database(
+                mysql.get("name"), mysql.get("user"), mysql.get("password"),
+                mysql.get("host") or "127.0.0.1",
+            )
+            entry["actions"].append(
+                f"created database {entry['database']['name']} "
+                f"and user {entry['database']['user']}"
+            )
+    except (HelperError, OSError) as exc:
+        entry["problems"].append(str(exc))
+
+    entry["ok"] = not entry["problems"]
+    return entry
+
+
+def _remove_project(item):
+    if isinstance(item, str):
+        item = {"name": item, "hostnames": []}
+    if not isinstance(item, dict):
+        return {"name": None, "actions": [],
+                "problems": ["invalid removal entry"], "ok": False}
+    entry = {"name": str(item.get("name") or ""), "actions": [], "problems": []}
+
+    try:
+        path = remove_vhost(entry["name"], missing_ok=True)
+        entry["actions"].append(f"removed {path}" if path else
+                                f"no virtual host config for {entry['name']}")
+        for hostname in _list_field(item.get("hostnames"), "hostnames"):
+            hostname = check_hostname(str(hostname))
+            if hosts_remove(hostname):
+                entry["actions"].append(f"removed {hostname} from /etc/hosts")
+    except (HelperError, OSError) as exc:
+        entry["problems"].append(str(exc))
+
+    entry["ok"] = not entry["problems"]
+    return entry
+
+
+def cmd_apply_projects(args):
+    """Apply a whole batch of project changes under a single pkexec prompt.
+
+    Reads a JSON object from stdin. Nothing here trusts the input: every
+    field goes through the same validators used by the single-purpose
+    subcommands. One bad project does not abort the rest.
+    """
+    try:
+        spec = json.loads(sys.stdin.read() or "{}")
+    except json.JSONDecodeError as exc:
+        fail(f"Invalid JSON input: {exc}")
+    if not isinstance(spec, dict):
+        fail("Invalid input: expected a JSON object")
+
+    projects = _list_field(spec.get("projects"), "projects")
+    removals = _list_field(spec.get("remove"), "remove")
+
+    result = {"projects": [], "removed": [], "reload": None}
+    problem_count = 0
+
+    for item in projects:
+        if not isinstance(item, dict):
+            entry = {"name": None, "actions": [], "problems": ["invalid project entry"],
+                     "vhost": None, "database": None, "ok": False}
+        else:
+            entry = _apply_project(item)
+        problem_count += len(entry["problems"])
+        result["projects"].append(entry)
+
+    for item in removals:
+        entry = _remove_project(item)
+        problem_count += len(entry["problems"])
+        result["removed"].append(entry)
+
+    if spec.get("reload"):
+        r = subprocess.run(
+            ["systemctl", "reload", "httpd"], capture_output=True, text=True
+        )
+        message = (r.stderr or r.stdout).strip()
+        result["reload"] = {"ok": r.returncode == 0, "message": message}
+        if r.returncode != 0:
+            problem_count += 1
+
+    print(json.dumps(result))
+    return 0 if problem_count == 0 else 2
+
+
 def cmd_read_log(args):
     """Return the tail of an Apache log (root-only readable)."""
     hostname = check_hostname(args.hostname)
@@ -586,6 +830,9 @@ def build_parser():
     s = sub.add_parser("mysql")
     s.set_defaults(func=cmd_mysql)
 
+    s = sub.add_parser("apply-projects")
+    s.set_defaults(func=cmd_apply_projects)
+
     s = sub.add_parser("read-log")
     s.add_argument("--hostname", required=True)
     s.add_argument("--kind", choices=["error", "access"], default="error")
@@ -599,7 +846,11 @@ def main():
     if os.geteuid() != 0:
         fail("localstack helper must run as root (invoke it via privileged.py)")
     args = build_parser().parse_args()
-    sys.exit(args.func(args))
+    try:
+        sys.exit(args.func(args))
+    except HelperError as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
